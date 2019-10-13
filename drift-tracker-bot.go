@@ -3,25 +3,15 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
-
-/*
-	#admin commands
-
-	/event-open
-	/event-close
-	/history
-
-	/event-show
-	/register
-	/unregister
-
-*/
 
 type JsonAny = interface{}
 type JsonTable = map[string]JsonAny
@@ -35,20 +25,34 @@ func (e TgApiError) Error() string {
 	return string(e)
 }
 
+type MemberRecord struct {
+	Name    string
+	License string
+}
+
+type EventInfo struct {
+	Description string
+	EventId     int
+
+	Registrations []MemberRecord
+}
+
 const (
-	tg_api_url    = "https://api.telegram.org/bot"
-	bot_token     = ""
+	//	tg_api_url    = "https://api.telegram.org/bot"
+	tg_api_url    = "http://83.220.168.42:8090/bot"
 	update_freq   = 0.5 // hz
 	updates_limit = 10
 )
 
 const (
-	AUTHORIZE_ERROR_TXT = "Вы должны обладать правами администратора для выполнения данной команды."
-	EVENT_OPEN_QUESTION = "Введите описание планируемого события:"
-	REPLY_TIMEOUT       = "Срок ожидания ответа истёк. Попробуйте выполнить операцию ещё раз."
+	AuthorizeErrorMsg       = "Вы должны обладать правами администратора для выполнения данной команды."
+	EventOpenAskDescription = "Введите описание планируемого события:"
+	EventOpenAlreadyExists  = "В выбранном канале уже есть активное событие. Закройте его для создания нового."
+	EventOpenReport         = "Событие #%d созданно."
+	ReplyTimoutMsg          = "Срок ожидания ответа истёк. Попробуйте выполнить операцию ещё раз."
 )
 
-const HELP_MESSAGE = `
+const HelpMsg = `
 	/open - Создать событие (только для админов канала)
 	/close - Закрыть региcтрацию на событие (только для админов канала)
 	/show - Показать текущее событие и список зарегестрированных участников
@@ -61,6 +65,9 @@ var (
 	http_client *http.Client
 	bot_url     string
 	bot_name    string
+
+	id_counter     int32
+	current_events = map[json.Number]*EventInfo{}
 )
 
 func toJson(obj JsonAny) string {
@@ -119,21 +126,21 @@ func tgApiCall(tg_func string, msg JsonTable) (JsonAny, error) {
 		return nil, err
 	}
 
-	respTbl, ok := respJson.(JsonTable)
+	resp_tbl, ok := respJson.(JsonTable)
 	if ok != true {
 		return nil, TgApiError("non-table response")
 	}
 
-	ok, hasOk := respTbl["ok"].(bool)
+	ok, hasOk := resp_tbl["ok"].(bool)
 	if hasOk == false {
 		return nil, TgApiError("Bad response status")
 	}
 
 	if ok != true {
-		return nil, TgApiError(getStr(respTbl, "description"))
+		return nil, TgApiError(getStr(resp_tbl, "description"))
 	}
 
-	return respTbl["result"], err
+	return resp_tbl["result"], err
 }
 
 func pollMessages(offset int64) []JsonTable {
@@ -207,39 +214,48 @@ func isUserAdmin(user_id json.Number, chat_id json.Number) (bool, error) {
 	return false, nil
 }
 
+func getChatId(message JsonTable) json.Number {
+	return getNum(getTbl(message, "chat"), "id")
+}
+
+func getSenderId(message JsonTable) json.Number {
+	return getNum(getTbl(message, "from"), "id")
+}
+
 func authorize(message JsonTable) bool {
-	chatId := getNum(getTbl(message, "chat"), "id")
-	authOk, _ := isUserAdmin(getNum(getTbl(message, "from"), "id"), chatId)
-	if authOk {
+	chat_id := getChatId(message)
+	user_id := getSenderId(message)
+	auth_ok, _ := isUserAdmin(user_id, chat_id)
+	if auth_ok {
 		return true
 	}
 
-	sendPrivateMessage(getNum(getTbl(message, "from"), "id"), AUTHORIZE_ERROR_TXT, false)
+	sendPrivateMessage(user_id, AuthorizeErrorMsg, false)
 	return false
 }
 
-var replyHub = map[json.Number]chan JsonAny{}
-var replyHubMux = sync.Mutex{}
+var reply_hub = map[json.Number]chan JsonAny{}
+var reply_hub_mux = sync.Mutex{}
 
 func waitForReply(message_id json.Number) (JsonAny, error) {
-	replyHubMux.Lock()
-	ch, ok := replyHub[message_id]
+	reply_hub_mux.Lock()
+	ch, ok := reply_hub[message_id]
 	if ok == false {
 		ch = make(chan JsonAny)
-		replyHub[message_id] = ch
+		reply_hub[message_id] = ch
 	}
-	replyHubMux.Unlock()
+	reply_hub_mux.Unlock()
 
 	select {
 	case message := <-ch:
-		replyHubMux.Lock()
-		delete(replyHub, message_id)
-		replyHubMux.Unlock()
+		reply_hub_mux.Lock()
+		delete(reply_hub, message_id)
+		reply_hub_mux.Unlock()
 		return message, nil
 	case <-time.After(5 * time.Minute):
-		replyHubMux.Lock()
-		delete(replyHub, message_id)
-		replyHubMux.Unlock()
+		reply_hub_mux.Lock()
+		delete(reply_hub, message_id)
+		reply_hub_mux.Unlock()
 		return nil, TgApiError("Reply timeout")
 	}
 
@@ -248,13 +264,13 @@ func waitForReply(message_id json.Number) (JsonAny, error) {
 
 func processReply(message JsonTable) {
 	reply_message_id := getNum(getTbl(message, "reply_to_message"), "message_id")
-	replyHubMux.Lock()
-	ch, ok := replyHub[reply_message_id]
-	replyHubMux.Unlock()
+	reply_hub_mux.Lock()
+	ch, ok := reply_hub[reply_message_id]
+	reply_hub_mux.Unlock()
 	if ok {
 		ch <- message
 	} else {
-		sendPrivateMessage(getNum(getTbl(message, "from"), "id"), REPLY_TIMEOUT, false)
+		sendPrivateMessage(getSenderId(message), ReplyTimoutMsg, false)
 	}
 }
 
@@ -264,29 +280,93 @@ func askQuestion(userId json.Number, question string) (JsonAny, error) {
 		return nil, err
 	}
 
-	messageId := getNum(resp.(JsonTable), "message_id")
-	return waitForReply(messageId)
+	message_id := getNum(resp.(JsonTable), "message_id")
+	return waitForReply(message_id)
 }
 
 func eventOpen(message JsonTable) {
 	if !authorize(message) {
 		return
 	}
+	chat_id := getChatId(message)
+	user_id := getSenderId(message)
 
-	userId := getNum(getTbl(message, "from"), "id")
-	answer, err := askQuestion(userId, EVENT_OPEN_QUESTION)
+	_, ok := current_events[chat_id]
+	if ok {
+		sendPrivateMessage(user_id, EventOpenAlreadyExists, false)
+		return
+	}
+
+	answer, err := askQuestion(user_id, EventOpenAskDescription)
 	if err != nil {
 		log.Printf("Failed to get answer: %v", err)
 		return
 	}
 
-	log.Printf("eventOpen reply: %v", getStr(answer.(JsonTable), "text"))
+	desc := getStr(answer.(JsonTable), "text")
+	log.Printf("eventOpen reply: %v", desc)
+	newEvent := EventInfo{}
+	newEvent.Description = desc
+	newEvent.EventId = int(atomic.AddInt32(&id_counter, 1))
+	current_events[chat_id] = &newEvent
+
+	sendPrivateMessage(user_id, fmt.Sprintf(EventOpenReport, newEvent.EventId), false)
 }
 
 func eventClose(message JsonTable) {
 	if !authorize(message) {
 		return
 	}
+
+	//chat_id := getChatId(message)
+	user_id := getSenderId(message)
+
+	replyKeyboardMarkup := JsonTable{
+		"keyboard":        [][]string{{"YES"}, {"NO"}},
+		"resize_keyboard": true,
+		"selective":       true,
+		"force_reply":     true,
+	}
+
+	request := JsonTable{
+		"chat_id":      user_id,
+		"text":         "Yes/No",
+		"parse_mode":   "Markdown",
+		"reply_markup": replyKeyboardMarkup,
+	}
+
+	resp, err := tgApiCall("sendMessage", request)
+	if err != nil {
+		log.Printf("failed to send reply %v", err)
+	}
+
+	log.Printf("<%s", toJson(resp))
+	message_id := getNum(resp.(JsonTable), "message_id")
+	log.Printf("wait for reply to %d", message_id)
+	reply, err := waitForReply(message_id)
+
+	log.Printf("got reply to message %d", message_id)
+	log.Println(toJson(reply))
+
+	request = JsonTable{
+		"chat_id": user_id,
+		"text":    "remove_keyboard",
+		"reply_markup": JsonTable{
+			"remove_keyboard": true,
+		},
+	}
+	resp, err = tgApiCall("sendMessage", request)
+	if err != nil {
+		log.Println(err)
+	}
+
+	/*
+		_, ok := current_events[chat_id]
+		if !ok {
+			sendPrivateMessage(user_id, EventOpenAlreadyExists, false)
+			return
+		}
+	*/
 }
 
 func eventShow(message JsonTable) {
@@ -302,19 +382,19 @@ func unregister(message JsonTable) {
 }
 
 func help(message JsonTable) {
-	sendPrivateMessage(getNum(getTbl(message, "from"), "id"), HELP_MESSAGE, false)
+	sendPrivateMessage(getSenderId(message), HelpMsg, false)
 }
 
 func whoAmI(message JsonTable) {
-	chatId := getNum(getTbl(message, "chat"), "id")
-	messageId := getNum(message, "message_id")
+	chat_id := getNum(getTbl(message, "chat"), "id")
+	message_id := getNum(message, "message_id")
 	resp, err := tgApiCall("getChatMember",
 		JsonTable{
-			"chat_id": chatId,
+			"chat_id": chat_id,
 			"user_id": getNum(getTbl(message, "from"), "id"),
 		})
 	if err == nil {
-		sendReply(chatId, messageId, "```\n"+toJson(resp)+"```")
+		sendReply(chat_id, message_id, "```\n"+toJson(resp)+"```")
 	} else {
 		log.Printf("failed to get chat member %v", err)
 	}
@@ -339,13 +419,13 @@ func handleMessage(messageObj JsonTable) {
 		log.Printf(toJson(messageObj))
 		text := getStr(message, "text")
 
-		delimIdx := strings.Index(text, "@")
-		if delimIdx != -1 {
-			botName := text[delimIdx+1:]
+		i := strings.Index(text, "@")
+		if i != -1 {
+			botName := text[i+1:]
 			if botName != bot_name {
 				return
 			}
-			text = text[:delimIdx]
+			text = text[:i]
 		}
 		log.Printf("text %s", text)
 
@@ -357,6 +437,7 @@ func handleMessage(messageObj JsonTable) {
 }
 
 func main() {
+	bot_token := os.Getenv("BOT_TOKEN")
 	bot_url = tg_api_url + bot_token + "/"
 	log.Printf("Bot url is %s", bot_url)
 	http_client = &http.Client{}
